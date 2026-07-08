@@ -238,15 +238,20 @@ def collect_section(section, section_number, total_sections, evidence):
         read_only=True,
     )
 
-    header = Label(
-        text=f"\n{'=' * 80}\n  SECTION {section_number} of {total_sections}: {section['title'].upper()}\n{'=' * 80}\n",
-        style="fg:bold bg:#003366"
-    )
-
-    progress = Label(
-        text=f"Progress: {progress_bar(section_number - 1, total_sections)}",
-        style="fg:cyan"
-    )
+    title_text = f"SECTION {section_number}/{total_sections}: {section['title'].upper()}"
+    border = "═" * (len(title_text) + 4)
+    progress_text = f"Progress: {progress_bar(section_number - 1, total_sections)}"
+    
+    header = VSplit([
+        Label(
+            text=f"\n╔{border}╗\n║  {title_text}  ║\n╚{border}╝\n",
+            style="bold fg:yellow"
+        ),
+        Label(
+            text=f"\n\n{progress_text}\n\n",
+            style="fg:cyan"
+        ),
+    ])
 
     command_footer = Label(
         text="Commands: Ctrl-N = next section | Ctrl-C = quit"
@@ -267,10 +272,7 @@ def collect_section(section, section_number, total_sections, evidence):
         Frame(evidence_area, title="Current Evidence")
     ])
 
-    right = VSplit([
-        Frame(template_area, title="Template Section Preview"),
-        Box(progress, padding=1)
-    ])
+    right = Frame(template_area, title="Template Section Preview")
 
     root_container = HSplit([
         header,
