@@ -1,3 +1,4 @@
+import base64
 import os
 import re
 import shlex
@@ -5,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import openai
 from pypdf import PdfReader
 from prompt_toolkit import Application
 from prompt_toolkit.application import run_in_terminal
@@ -39,25 +41,34 @@ Describe emergency procedures involving breakfast systems, pancake containment, 
 """
 
 
-def ask_copilot(prompt: str) -> str:
-    result = subprocess.run(
-        [
-            "copilot",
-            "-p",
-            prompt
-        ],
-        capture_output=True,
-        text=True,
-        #env={
-        #    **os.environ,
-        #    "COPILOT_GITHUB_TOKEN": os.environ["GITHUB_TOKEN"]
-        #}
+def ask_copilot(prompt: str, image_paths: list = None) -> str:
+    """Call Copilot API with optional vision support for images."""
+    if image_paths is None:
+        image_paths = []
+    
+    client = openai.OpenAI(
+        base_url="https://api.githubcopilot.com",
+        api_key=os.environ.get("GITHUB_TOKEN")
     )
-
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr)
-
-    return result.stdout
+    
+    content = [{"type": "text", "text": prompt}]
+    
+    for path in image_paths:
+        if Path(path).exists():
+            image_data = base64.b64encode(Path(path).read_bytes()).decode()
+            suffix = Path(path).suffix.lower()
+            media_type = "image/png" if suffix == ".png" else "image/jpeg"
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{media_type};base64,{image_data}"}
+            })
+    
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": content}]
+    )
+    
+    return response.choices[0].message.content
 
 
 def extract_markdown_output(raw_output: str) -> str:
@@ -189,11 +200,11 @@ def render_evidence(section_evidence):
 
 
 def take_screenshot(section_title: str, evidence, evidence_area):
-    screenshots_dir = Path("screenshots")
-    screenshots_dir.mkdir(exist_ok=True)
+    assets_dir = Path("assets")
+    assets_dir.mkdir(exist_ok=True)
 
     count = len(evidence["document_images"]) + len(evidence["context_images"]) + 1
-    filename = screenshots_dir / f"{slugify(section_title)}-{count}.png"
+    filename = assets_dir / f"{slugify(section_title)}-{count}.png"
 
     subprocess.run(["screencapture", "-i", str(filename)])
 
@@ -306,6 +317,7 @@ def print_bill_of_evidence(sections, all_evidence):
 
 
 def build_generation_prompt(sections, all_evidence):
+    """Build text prompt for Copilot. Images will be passed separately."""
     prompt_parts = []
 
     prompt_parts.append("Generate a clean markdown first draft using the template and evidence below.")
@@ -339,9 +351,7 @@ def build_generation_prompt(sections, all_evidence):
                 prompt_parts.append(f"- {path}\n")
 
         if evidence["context_images"]:
-            prompt_parts.append("\nCONTEXT-ONLY IMAGES SUPPLIED:\n")
-            for path in evidence["context_images"]:
-                prompt_parts.append(f"- {path}\n")
+            prompt_parts.append("\nCONTEXT-ONLY REFERENCE MATERIALS: See attached images.\n")
 
     prompt_parts.append(
         "\n\nReturn only the completed markdown draft and nothing else. "
@@ -349,6 +359,14 @@ def build_generation_prompt(sections, all_evidence):
     )
 
     return "\n".join(prompt_parts)
+
+
+def collect_all_context_images(all_evidence):
+    """Gather all context_images from all sections for vision API."""
+    images = []
+    for evidence in all_evidence.values():
+        images.extend(evidence.get("context_images", []))
+    return images
 
 
 def main():
@@ -397,8 +415,10 @@ def main():
 
     if generate == "y":
         prompt = build_generation_prompt(sections, all_evidence)
-        raw_draft = ask_copilot(prompt)
-        draft = extract_markdown_output(raw_draft)
+        context_images = collect_all_context_images(all_evidence)
+        
+        draft = ask_copilot(prompt, image_paths=context_images)
+        draft = extract_markdown_output(draft)
 
         output_path = Path("starship_first_draft.md")
         output_path.write_text(draft)
