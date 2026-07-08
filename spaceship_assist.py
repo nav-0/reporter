@@ -1,12 +1,11 @@
-import base64
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-import openai
 from pypdf import PdfReader
 from prompt_toolkit import Application
 from prompt_toolkit.application import run_in_terminal
@@ -41,34 +40,21 @@ Describe emergency procedures involving breakfast systems, pancake containment, 
 """
 
 
-def ask_copilot(prompt: str, image_paths: list = None) -> str:
-    """Call Copilot API with optional vision support for images."""
-    if image_paths is None:
-        image_paths = []
-    
-    client = openai.OpenAI(
-        base_url="https://api.githubcopilot.com",
-        api_key=os.environ.get("GITHUB_TOKEN")
+def ask_copilot(prompt: str) -> str:
+    result = subprocess.run(
+        [
+            "copilot",
+            "-p",
+            prompt
+        ],
+        capture_output=True,
+        text=True,
     )
-    
-    content = [{"type": "text", "text": prompt}]
-    
-    for path in image_paths:
-        if Path(path).exists():
-            image_data = base64.b64encode(Path(path).read_bytes()).decode()
-            suffix = Path(path).suffix.lower()
-            media_type = "image/png" if suffix == ".png" else "image/jpeg"
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{media_type};base64,{image_data}"}
-            })
-    
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": content}]
-    )
-    
-    return response.choices[0].message.content
+
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr)
+
+    return result.stdout
 
 
 def extract_markdown_output(raw_output: str) -> str:
@@ -120,6 +106,24 @@ def progress_bar(current: int, total: int):
 
 def is_image(path: str):
     return Path(path).suffix.lower() in [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp"]
+
+
+def is_pdf(path: str):
+    return Path(path).suffix.lower() == ".pdf"
+
+
+def copy_to_assets(file_path: str) -> str:
+    """Copy a file to the assets folder and return the new local path."""
+    assets_dir = Path("assets")
+    assets_dir.mkdir(exist_ok=True)
+    
+    source = Path(file_path)
+    if not source.exists():
+        return file_path
+    
+    destination = assets_dir / source.name
+    shutil.copy2(source, destination)
+    return str(destination)
 
 
 def is_pdf(path: str):
@@ -184,13 +188,8 @@ def render_evidence(section_evidence):
             lines.append(f"- {item}")
 
     if section_evidence["document_images"]:
-        lines.append("Images to include in final draft:")
+        lines.append("Images for final draft:")
         for item in section_evidence["document_images"]:
-            lines.append(f"- {item}")
-
-    if section_evidence["context_images"]:
-        lines.append("Context-only images:")
-        for item in section_evidence["context_images"]:
             lines.append(f"- {item}")
 
     if not lines:
@@ -199,23 +198,7 @@ def render_evidence(section_evidence):
     return "\n".join(lines)
 
 
-def take_screenshot(section_title: str, evidence, evidence_area):
-    assets_dir = Path("assets")
-    assets_dir.mkdir(exist_ok=True)
 
-    count = len(evidence["document_images"]) + len(evidence["context_images"]) + 1
-    filename = assets_dir / f"{slugify(section_title)}-{count}.png"
-
-    subprocess.run(["screencapture", "-i", str(filename)])
-
-    mode = input("\nUse this screenshot in final draft? [y = include / n = context only]: ").strip().lower()
-
-    if mode == "y":
-        evidence["document_images"].append(str(filename))
-    else:
-        evidence["context_images"].append(str(filename))
-
-    evidence_area.text = render_evidence(evidence)
 
 
 def collect_section(section, section_number, total_sections, evidence):
@@ -251,18 +234,14 @@ def collect_section(section, section_number, total_sections, evidence):
     )
 
     command_footer = Label(
-        text="Commands: Ctrl-N = next section | Ctrl-S = screenshot | Ctrl-C = quit"
+        text="Commands: Ctrl-N = next section | Ctrl-C = quit"
     )
 
     @kb.add("c-n")
     def _(event):
         event.app.exit(result=input_area.text)
 
-    @kb.add("c-s")
-    def _(event):
-        run_in_terminal(
-            lambda: take_screenshot(section["title"], evidence, evidence_area)
-        )
+
 
     @kb.add("c-c")
     def _(event):
@@ -293,15 +272,6 @@ def collect_section(section, section_number, total_sections, evidence):
     return app.run()
 
 
-def ask_image_usage(path: str, evidence):
-    mode = input(f"\nImage added: {path}\nUse in final draft? [y = include / n = context only]: ").strip().lower()
-
-    if mode == "y":
-        evidence["document_images"].append(path)
-    else:
-        evidence["context_images"].append(path)
-
-
 def print_bill_of_evidence(sections, all_evidence):
     print("\n" + "=" * 80)
     print("BILL OF EVIDENCE")
@@ -317,7 +287,6 @@ def print_bill_of_evidence(sections, all_evidence):
 
 
 def build_generation_prompt(sections, all_evidence):
-    """Build text prompt for Copilot. Images will be passed separately."""
     prompt_parts = []
 
     prompt_parts.append("Generate a clean markdown first draft using the template and evidence below.")
@@ -350,23 +319,12 @@ def build_generation_prompt(sections, all_evidence):
             for path in evidence["document_images"]:
                 prompt_parts.append(f"- {path}\n")
 
-        if evidence["context_images"]:
-            prompt_parts.append("\nCONTEXT-ONLY REFERENCE MATERIALS: See attached images.\n")
-
     prompt_parts.append(
         "\n\nReturn only the completed markdown draft and nothing else. "
         "Do not include explanations, notes, logs, metadata, code fences, or any surrounding text."
     )
 
     return "\n".join(prompt_parts)
-
-
-def collect_all_context_images(all_evidence):
-    """Gather all context_images from all sections for vision API."""
-    images = []
-    for evidence in all_evidence.values():
-        images.extend(evidence.get("context_images", []))
-    return images
 
 
 def main():
@@ -381,8 +339,7 @@ def main():
         section["title"]: {
             "text": [],
             "files": [],
-            "document_images": [],
-            "context_images": []
+            "document_images": []
         }
         for section in sections
     }
@@ -405,7 +362,9 @@ def main():
 
         for path in files:
             if is_image(path):
-                ask_image_usage(path, evidence)
+                # Copy image to assets and use local path
+                local_path = copy_to_assets(path)
+                evidence["document_images"].append(local_path)
             else:
                 evidence["files"].append(path)
 
@@ -415,10 +374,8 @@ def main():
 
     if generate == "y":
         prompt = build_generation_prompt(sections, all_evidence)
-        context_images = collect_all_context_images(all_evidence)
-        
-        draft = ask_copilot(prompt, image_paths=context_images)
-        draft = extract_markdown_output(draft)
+        raw_draft = ask_copilot(prompt)
+        draft = extract_markdown_output(raw_draft)
 
         output_path = Path("starship_first_draft.md")
         output_path.write_text(draft)
