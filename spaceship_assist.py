@@ -4,6 +4,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from pypdf import PdfReader
@@ -99,9 +100,18 @@ def slugify(value: str):
 
 
 def progress_bar(current: int, total: int):
-    width = 20
+    width = 15
     filled = int(width * current / total)
     return "[" + "█" * filled + "░" * (width - filled) + f"] {current}/{total}"
+
+
+def loading_animation():
+    """Display a loading animation while waiting for Copilot."""
+    frames = ["|  Analyzing...", "/  Analyzing...", "-  Analyzing...", "\\  Analyzing.."]
+    for i in range(20):  # Show animation for ~2 seconds
+        print(f"\r{frames[i % len(frames)]}", end="", flush=True)
+        time.sleep(0.1)
+    print("\r                    ", end="", flush=True)  # Clear the line
 
 
 def is_image(path: str):
@@ -229,8 +239,13 @@ def collect_section(section, section_number, total_sections, evidence):
     )
 
     header = Label(
-        text=f"Section {section_number} of {total_sections}: {section['title']}    "
-             f"{progress_bar(section_number - 1, total_sections)}"
+        text=f"\n{'=' * 80}\n  SECTION {section_number} of {total_sections}: {section['title'].upper()}\n{'=' * 80}\n",
+        style="fg:bold bg:#003366"
+    )
+
+    progress = Label(
+        text=f"Progress: {progress_bar(section_number - 1, total_sections)}",
+        style="fg:cyan"
     )
 
     command_footer = Label(
@@ -252,7 +267,10 @@ def collect_section(section, section_number, total_sections, evidence):
         Frame(evidence_area, title="Current Evidence")
     ])
 
-    right = Frame(template_area, title="Template Section Preview")
+    right = VSplit([
+        Frame(template_area, title="Template Section Preview"),
+        Box(progress, padding=1)
+    ])
 
     root_container = HSplit([
         header,
@@ -373,7 +391,9 @@ def main():
     generate = input("\nGenerate first draft with Copilot? [y/n]: ").strip().lower()
 
     if generate == "y":
+        print("\nRequesting analysis from Copilot...")
         prompt = build_generation_prompt(sections, all_evidence)
+        loading_animation()
         raw_draft = ask_copilot(prompt)
         draft = extract_markdown_output(raw_draft)
 
