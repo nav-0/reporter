@@ -1,4 +1,4 @@
-import os
+import json
 import re
 import shlex
 import shutil
@@ -38,6 +38,9 @@ Describe the types of cargo, unusual materials, alien objects, and handling requ
 
 Describe emergency procedures involving breakfast systems, pancake containment, syrup routing, and crew safety.
 """
+
+REPORTS_DIR = Path("spaceships")
+TMP_REPORTS_DIR = Path("tmp") / "reports"
 
 
 def ask_copilot(prompt: str) -> str:
@@ -123,9 +126,9 @@ def is_pdf(path: str):
     return Path(path).suffix.lower() == ".pdf"
 
 
-def copy_to_assets(file_path: str) -> str:
+def copy_to_assets(file_path: str, report_dir: Path) -> str:
     """Copy a file to the assets folder and return the new local path."""
-    assets_dir = Path("assets")
+    assets_dir = report_dir / "assets"
     assets_dir.mkdir(exist_ok=True)
     
     source = Path(file_path)
@@ -141,9 +144,8 @@ def copy_to_assets(file_path: str) -> str:
         candidate = assets_dir / f"{base_name}-{counter}{suffix}"
         counter += 1
 
-    destination = candidate
-    shutil.copy2(source, destination)
-    return str(destination)
+    shutil.copy2(source, candidate)
+    return f"assets/{candidate.name}"
 
 
 def is_text_file(path: str):
@@ -287,16 +289,20 @@ def collect_section(section, section_number, total_sections, evidence):
     )
 
     command_footer = Label(
-        text="Commands: Drag/drop files into Data Entry | Ctrl-N = next section | Ctrl-C = quit"
+        text="Commands: Drag/drop files into Data Entry | Ctrl-N = next section | Ctrl-S = save and quit | Ctrl-C = quit without saving progress"
     )
 
     @kb.add("c-n")
     def _(event):
-        event.app.exit(result=input_area.text)
+        event.app.exit(result={"action": "next", "text": input_area.text})
+
+    @kb.add("c-s")
+    def _(event):
+        event.app.exit(result={"action": "save_quit", "text": input_area.text})
 
     @kb.add("c-c")
     def _(event):
-        event.app.exit(exception=KeyboardInterrupt)
+        event.app.exit(result={"action": "quit_without_save", "text": input_area.text})
 
     left = HSplit([
         Frame(input_area, title="Data Entry (Drop Zone) - type notes and drag/drop images/documents here"),
@@ -321,6 +327,135 @@ def collect_section(section, section_number, total_sections, evidence):
     )
 
     return app.run()
+
+
+def empty_evidence(sections):
+    return {
+        section["title"]: {
+            "text": [],
+            "files": [],
+            "document_images": [],
+        }
+        for section in sections
+    }
+
+
+def marker_path_for(report_dir: Path) -> Path:
+    return TMP_REPORTS_DIR / f"{report_dir.name}.pending.json"
+
+
+def save_progress_state(state):
+    report_dir = Path(state["report_dir"])
+    report_dir.mkdir(parents=True, exist_ok=True)
+    (report_dir / "assets").mkdir(exist_ok=True)
+
+    progress_path = report_dir / "progress.json"
+    progress_path.write_text(json.dumps(state, indent=2))
+
+    TMP_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    marker_payload = {
+        "name": state["name"],
+        "report_dir": state["report_dir"],
+        "saved_at": int(time.time()),
+    }
+    marker_path_for(report_dir).write_text(json.dumps(marker_payload, indent=2))
+
+
+def remove_progress_state(report_dir: Path):
+    progress_path = report_dir / "progress.json"
+    if progress_path.exists():
+        progress_path.unlink()
+
+    marker = marker_path_for(report_dir)
+    if marker.exists():
+        marker.unlink()
+
+
+def list_unfinished_reports():
+    if not TMP_REPORTS_DIR.exists():
+        return []
+
+    reports = []
+    for marker in sorted(TMP_REPORTS_DIR.glob("*.pending.json")):
+        try:
+            data = json.loads(marker.read_text())
+        except json.JSONDecodeError:
+            continue
+
+        report_dir = Path(data.get("report_dir", ""))
+        progress_path = report_dir / "progress.json"
+        if not progress_path.exists():
+            continue
+
+        try:
+            progress_data = json.loads(progress_path.read_text())
+            current_index = int(progress_data.get("current_section_index", 0))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            current_index = 0
+
+        reports.append({
+            "name": data.get("name", report_dir.name),
+            "report_dir": str(report_dir),
+            "current_section_index": current_index,
+        })
+
+    return reports
+
+
+def create_new_report_state(sections):
+    name = input("Enter spaceship name: ").strip()
+    while not name:
+        name = input("Spaceship name is required. Enter spaceship name: ").strip()
+
+    report_id = f"{slugify(name) or 'spaceship'}-{int(time.time())}"
+    report_dir = REPORTS_DIR / report_id
+    report_dir.mkdir(parents=True, exist_ok=True)
+    (report_dir / "assets").mkdir(exist_ok=True)
+
+    state = {
+        "name": name,
+        "report_dir": str(report_dir),
+        "current_section_index": 0,
+        "all_evidence": empty_evidence(sections),
+    }
+    save_progress_state(state)
+    return state
+
+
+def choose_report_state(sections):
+    unfinished = list_unfinished_reports()
+
+    print("\nSelect an option:")
+    print("1. Start a new spaceship report")
+    if unfinished:
+        print("2. Continue an unfinished report")
+    print("q. Quit")
+
+    choice = input("Choice: ").strip().lower()
+    while choice not in (["1", "2", "q"] if unfinished else ["1", "q"]):
+        choice = input("Enter a valid choice: ").strip().lower()
+
+    if choice == "q":
+        return None
+
+    if choice == "1":
+        return create_new_report_state(sections)
+
+    print("\nUnfinished reports:")
+    for idx, item in enumerate(unfinished, start=1):
+        print(
+            f"{idx}. {item['name']} "
+            f"(progress: completed {item['current_section_index']} sections)"
+        )
+
+    selected = input("Select report number: ").strip()
+    valid_numbers = {str(i) for i in range(1, len(unfinished) + 1)}
+    while selected not in valid_numbers:
+        selected = input("Enter a valid report number: ").strip()
+
+    chosen = unfinished[int(selected) - 1]
+    progress_path = Path(chosen["report_dir"]) / "progress.json"
+    return json.loads(progress_path.read_text())
 
 
 def print_bill_of_evidence(sections, all_evidence):
@@ -391,38 +526,62 @@ def main():
 
     sections = parse_sections(TEMPLATE)
 
-    all_evidence = {
-        section["title"]: {
-            "text": [],
-            "files": [],
-            "document_images": []
-        }
-        for section in sections
-    }
+    state = choose_report_state(sections)
+    if state is None:
+        print("Exited.")
+        return 0
 
-    for index, section in enumerate(sections, start=1):
+    report_dir = Path(state["report_dir"])
+    all_evidence = state["all_evidence"]
+    current_section_index = int(state.get("current_section_index", 0))
+
+    print(f"\nWorking report: {state['name']}")
+    print(f"Directory: {report_dir.resolve()}\n")
+
+    for index in range(current_section_index, len(sections)):
+        section = sections[index]
         title = section["title"]
         evidence = all_evidence[title]
 
-        raw_input_text = collect_section(
+        section_result = collect_section(
             section=section,
-            section_number=index,
+            section_number=index + 1,
             total_sections=len(sections),
             evidence=evidence
         )
 
-        text, files = parse_input_into_text_and_files(raw_input_text)
+        action = section_result["action"]
+        raw_input_text = section_result["text"]
 
-        if text:
-            evidence["text"].append(text)
+        if action in ["next", "save_quit"]:
+            text, files = parse_input_into_text_and_files(raw_input_text)
 
-        for path in files:
-            if is_image(path):
-                # Copy image to assets and use local path
-                local_path = copy_to_assets(path)
-                evidence["document_images"].append(local_path)
-            else:
-                evidence["files"].append(path)
+            if text:
+                evidence["text"].append(text)
+
+            for path in files:
+                if is_image(path):
+                    local_path = copy_to_assets(path, report_dir)
+                    evidence["document_images"].append(local_path)
+                else:
+                    evidence["files"].append(path)
+
+        state["all_evidence"] = all_evidence
+
+        if action == "next":
+            state["current_section_index"] = index + 1
+            save_progress_state(state)
+            continue
+
+        if action == "save_quit":
+            state["current_section_index"] = index + 1
+            save_progress_state(state)
+            print("\nProgress saved. You can continue this report later from the startup menu.")
+            return 0
+
+        if action == "quit_without_save":
+            print("\nQuit without saving progress.")
+            return 0
 
     print_bill_of_evidence(sections, all_evidence)
 
@@ -442,14 +601,20 @@ def main():
         draft = extract_markdown_output(raw_draft)
         draft = normalize_markdown_image_paths(draft)
 
-        output_path = Path("starship_first_draft.md")
+        output_path = report_dir / "starship_first_draft.md"
         output_path.write_text(draft)
+
+        remove_progress_state(report_dir)
 
         print("\n" + "=" * 80)
         print("GENERATED FIRST DRAFT")
         print("=" * 80)
         print(draft)
         print(f"\nSaved to: {output_path.resolve()}")
+    else:
+        state["current_section_index"] = len(sections)
+        save_progress_state(state)
+        print("\nProgress saved. You can continue later and generate when ready.")
 
     return 0
 
