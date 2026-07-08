@@ -4,16 +4,15 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+from urllib.parse import unquote
 
 from pypdf import PdfReader
 from prompt_toolkit import Application
-from prompt_toolkit.application import run_in_terminal
-from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
-from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+from prompt_toolkit.layout import HSplit, Layout, VSplit
 from prompt_toolkit.widgets import Box, Frame, Label, TextArea
 
 
@@ -33,7 +32,7 @@ Describe who uses the vessel, who operates it, and what access or responsibility
 
 ## Cargo and Alien Artifacts
 
-Describe the types of cargo, unusual materials, alien objects, and handling requirements.
+Describe the types of cargo, unusual materials, alien objects, and handling requirements. Provide at least one photo and/or a written description for this section.
 
 ## Emergency Pancake Protocol
 
@@ -105,13 +104,15 @@ def progress_bar(current: int, total: int):
     return "[" + "█" * filled + "░" * (width - filled) + f"] {current}/{total}"
 
 
-def loading_animation():
+def loading_animation(stop_event: threading.Event):
     """Display a loading animation while waiting for Copilot."""
     frames = ["|  Analyzing...", "/  Analyzing...", "-  Analyzing...", "\\  Analyzing.."]
-    for i in range(20):  # Show animation for ~2 seconds
+    i = 0
+    while not stop_event.is_set():
         print(f"\r{frames[i % len(frames)]}", end="", flush=True)
         time.sleep(0.1)
-    print("\r                    ", end="", flush=True)  # Clear the line
+        i += 1
+    print("\r" + " " * 24 + "\r", end="", flush=True)
 
 
 def is_image(path: str):
@@ -130,14 +131,19 @@ def copy_to_assets(file_path: str) -> str:
     source = Path(file_path)
     if not source.exists():
         return file_path
-    
-    destination = assets_dir / source.name
+
+    # Normalize filenames for stable markdown links across platforms/previews.
+    base_name = slugify(source.stem) or "asset"
+    suffix = source.suffix.lower()
+    candidate = assets_dir / f"{base_name}{suffix}"
+    counter = 2
+    while candidate.exists() and candidate.resolve() != source.resolve():
+        candidate = assets_dir / f"{base_name}-{counter}{suffix}"
+        counter += 1
+
+    destination = candidate
     shutil.copy2(source, destination)
     return str(destination)
-
-
-def is_pdf(path: str):
-    return Path(path).suffix.lower() == ".pdf"
 
 
 def is_text_file(path: str):
@@ -193,19 +199,28 @@ def render_evidence(section_evidence):
         lines.append(f"Text entries: {len(section_evidence['text'])}")
 
     if section_evidence["files"]:
-        lines.append("Files:")
+        lines.append("Documents:")
         for item in section_evidence["files"]:
-            lines.append(f"- {item}")
+            lines.append(f"- {item} (text will be extracted and processed)")
 
     if section_evidence["document_images"]:
-        lines.append("Images for final draft:")
+        lines.append("Images:")
         for item in section_evidence["document_images"]:
-            lines.append(f"- {item}")
+            lines.append(f"- {item} (image will be included in final draft)")
 
     if not lines:
         return "(none yet)"
 
     return "\n".join(lines)
+
+
+def normalize_markdown_image_paths(markdown: str) -> str:
+    """Decode URL-encoded assets links in markdown image paths."""
+    return re.sub(
+        r"\((assets/[^)]+)\)",
+        lambda match: f"({unquote(match.group(1))})",
+        markdown,
+    )
 
 
 
@@ -238,38 +253,54 @@ def collect_section(section, section_number, total_sections, evidence):
         read_only=True,
     )
 
+    def update_evidence_preview(_):
+        text, file_paths = parse_input_into_text_and_files(input_area.text)
+        preview_evidence = {
+            "text": list(evidence["text"]),
+            "files": list(evidence["files"]),
+            "document_images": list(evidence["document_images"]),
+        }
+
+        if text:
+            preview_evidence["text"].append(text)
+
+        for path in file_paths:
+            if is_image(path):
+                preview_evidence["document_images"].append(path)
+            else:
+                preview_evidence["files"].append(path)
+
+        evidence_area.text = render_evidence(preview_evidence)
+
+    input_area.buffer.on_text_changed += update_evidence_preview
+
     title_text = f"SECTION {section_number}/{total_sections}: {section['title'].upper()}"
-    border = "═" * (len(title_text) + 4)
     progress_text = f"Progress: {progress_bar(section_number - 1, total_sections)}"
-    
-    header = VSplit([
-        Label(
-            text=f"\n╔{border}╗\n║  {title_text}  ║\n╚{border}╝\n",
-            style="bold fg:yellow"
-        ),
-        Label(
-            text=f"\n\n{progress_text}\n\n",
-            style="fg:cyan"
-        ),
-    ])
+    total_line_width = 98
+    pad = max(2, total_line_width - len(title_text) - len(progress_text))
+    header_line = f"{title_text}{' ' * pad}{progress_text}"
+    border = "═" * (len(header_line) + 4)
+
+    header = Label(
+        text=f"\n╔{border}╗\n║  {header_line}  ║\n╚{border}╝\n",
+        style="bold"
+    )
 
     command_footer = Label(
-        text="Commands: Ctrl-N = next section | Ctrl-C = quit"
+        text="Commands: Drag/drop files into Data Entry | Ctrl-N = next section | Ctrl-C = quit"
     )
 
     @kb.add("c-n")
     def _(event):
         event.app.exit(result=input_area.text)
 
-
-
     @kb.add("c-c")
     def _(event):
         event.app.exit(exception=KeyboardInterrupt)
 
     left = HSplit([
-        Frame(input_area, title="Data Entry - type notes, paste text, or drag/drop file paths here"),
-        Frame(evidence_area, title="Current Evidence")
+        Frame(input_area, title="Data Entry (Drop Zone) - type notes and drag/drop images/documents here"),
+        Frame(evidence_area, title="Current Evidence & Assets"),
     ])
 
     right = Frame(template_area, title="Template Section Preview")
@@ -312,6 +343,11 @@ def build_generation_prompt(sections, all_evidence):
     prompt_parts.append("Generate a clean markdown first draft using the template and evidence below.")
     prompt_parts.append("Use only the supplied evidence. Do not invent missing details.")
     prompt_parts.append("If a section has little or no evidence, keep it simple and do not fabricate.")
+    prompt_parts.append(
+        "If evidence is sparse, ambiguous, malformed, or unverified, preserve it under an "
+        "'Unverified Notes' subsection in the relevant section instead of omitting it."
+    )
+    prompt_parts.append("Use image paths exactly as provided. Do not URL-encode paths.")
     prompt_parts.append("\n\nTEMPLATE:\n")
     prompt_parts.append(TEMPLATE)
 
@@ -395,9 +431,16 @@ def main():
     if generate == "y":
         print("\nRequesting analysis from Copilot...")
         prompt = build_generation_prompt(sections, all_evidence)
-        loading_animation()
-        raw_draft = ask_copilot(prompt)
+        stop_spinner = threading.Event()
+        spinner_thread = threading.Thread(target=loading_animation, args=(stop_spinner,), daemon=True)
+        spinner_thread.start()
+        try:
+            raw_draft = ask_copilot(prompt)
+        finally:
+            stop_spinner.set()
+            spinner_thread.join()
         draft = extract_markdown_output(raw_draft)
+        draft = normalize_markdown_image_paths(draft)
 
         output_path = Path("starship_first_draft.md")
         output_path.write_text(draft)

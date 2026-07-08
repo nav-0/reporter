@@ -1,6 +1,3 @@
-# Context-only images (temporary reference materials, not for version control)
-screenshots/*-context-*.png
-
 # Python
 __pycache__/
 *.py[cod]
@@ -25,3 +22,4 @@ Thumbs.db
 # Temp
 tmp/
 *.tmp
+
